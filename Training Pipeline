@@ -1,0 +1,176 @@
+import os
+import math
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import joblib
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torch.optim as optim
+import warnings
+from typing import List
+from data_utils import synthesize_bangladesh_tannery, build_windows
+from model import CNNLSTMMulti, EffluentDataset
+
+warnings.filterwarnings("ignore")
+
+WINDOW_SIZE = 12 
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for Xb, coordsb, Yb in loader:
+        Xb, coordsb, Yb = Xb.to(device), coordsb.to(device), Yb.to(device)
+        
+        preds = model(Xb, coordsb)
+        loss = criterion(preds, Yb)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * Xb.size(0)
+        
+    return total_loss / len(loader.dataset)
+
+def evaluate_model(model, loader, device, y_scaler=None):
+    model.eval()
+    preds_all = []
+    trues_all = []
+    
+    with torch.no_grad():
+        for Xb, coordsb, Yb in loader:
+            Xb, coordsb, Yb = Xb.to(device), coordsb.to(device), Yb.to(device)
+            preds = model(Xb, coordsb)
+            preds_all.append(preds.cpu().numpy())
+            trues_all.append(Yb.cpu().numpy())
+            
+    preds_all = np.vstack(preds_all)
+    trues_all = np.vstack(trues_all)
+    
+    if y_scaler is not None:
+        preds_inv = y_scaler.inverse_transform(preds_all)
+        trues_inv = y_scaler.inverse_transform(trues_all)
+    else:
+        preds_inv = preds_all
+        trues_inv = trues_all
+        
+    mse = mean_squared_error(trues_inv, preds_inv)
+    mae = mean_absolute_error(trues_inv, preds_inv)
+    rmse = math.sqrt(mse)
+    r2_per_target = r2_score(trues_inv, preds_inv, multioutput='raw_values')
+    
+    return {"rmse": rmse, "mae": mae, "r2_per_target": r2_per_target}
+
+def main_pipeline():
+    
+    data_source_file = 'tannery_data_synthesized.csv'
+    if os.path.exists(data_source_file):
+        merged = pd.read_csv(data_source_file)
+        print(f"Data loaded from existing file: {data_source_file}")
+    else:
+        print("Input file not found. Generating synthetic data...")
+        merged = synthesize_bangladesh_tannery(n_samples=6000)
+        merged.to_csv(data_source_file, index=False)
+        print(f"Synthetic data saved to {data_source_file}.")
+
+    
+    feature_cols = ['pH','DO','TSS','conductivity','turbidity']
+    target_cols = ['BOD','COD','TDS']
+    
+    for c in feature_cols + target_cols:
+        merged[c] = merged.groupby('site_id')[c].transform(lambda x: x.fillna(x.median()))
+        merged[c] = merged[c].fillna(merged[c].median())
+        
+    merged['lat'] = merged.groupby('site_id')['lat'].transform(lambda x: x.fillna(x.median()))
+    merged['lon'] = merged.groupby('site_id')['lon'].transform(lambda x: x.fillna(x.median()))
+    global_lat = merged['lat'].mean() if merged['lat'].notna().any() else 23.85
+    global_lon = merged['lon'].mean() if merged['lon'].notna().any() else 90.25
+    merged['lat'].fillna(global_lat, inplace=True)
+    merged['lon'].fillna(global_lon, inplace=True)
+
+    X, Y, coords = build_windows(merged, feature_cols, target_cols, WINDOW_SIZE)
+    
+    if X is None:
+        raise RuntimeError("Not enough temporal data per site to create windows.")
+
+    nsamples = X.shape[0]
+    split_idx = int(0.8 * nsamples)
+    
+    idxs = np.arange(nsamples)
+    np.random.seed(42)
+    np.random.shuffle(idxs)
+    
+    X, Y, coords = X[idxs], Y[idxs], coords[idxs]
+    
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    Y_train, Y_test = Y[:split_idx], Y[split_idx:]
+    coords_train, coords_test = coords[:split_idx], coords[split_idx:]
+
+    n_features = X.shape[1]
+    seq_len = X.shape[2]
+    
+    X_train_flat = X_train.transpose(0,2,1).reshape(-1, n_features)
+    X_test_flat = X_test.transpose(0,2,1).reshape(-1, n_features)
+    
+    X_scaler = MinMaxScaler().fit(X_train_flat)
+    X_train_scaled = X_scaler.transform(X_train_flat).reshape(X_train.shape[0], seq_len, n_features).transpose(0,2,1)
+    X_test_scaled = X_scaler.transform(X_test_flat).reshape(X_test.shape[0], seq_len, n_features).transpose(0,2,1)
+    
+    Y_scaler = MinMaxScaler().fit(Y_train)
+    Y_train_scaled = Y_scaler.transform(Y_train)
+    Y_test_scaled = Y_scaler.transform(Y_test)
+    
+    batch_size = 64
+    train_dataset = EffluentDataset(X_train_scaled, coords_train, Y_train_scaled)
+    test_dataset = EffluentDataset(X_test_scaled, coords_test, Y_test_scaled)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CNNLSTMMulti(n_features, conv_channels=32, kernel_size=3, lstm_hidden=128, 
+                         lstm_layers=1, coord_dim=2, out_dim=len(target_cols)).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    
+    epochs = 60
+    best_rmse = float('inf')
+    model_path = "cnn_lstm_bangladesh_tannery.pth"
+    
+    print(f"\nStarting model training on {device} for {epochs} epochs...")
+    for epoch in range(1, epochs+1):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        metrics = evaluate_model(model, test_loader, device, y_scaler=Y_scaler)
+        val_rmse = metrics['rmse']
+
+        if val_rmse < best_rmse:
+            best_rmse = val_rmse
+            torch.save({'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict()}, 
+                        model_path)
+            joblib.dump(X_scaler, "X_scaler.joblib")
+            joblib.dump(Y_scaler, "Y_scaler.joblib")
+        
+        if epoch % 10 == 0 or epoch == epochs:
+            r2_str = ", ".join([f"{r:.2f}" for r in metrics['r2_per_target']])
+            print(f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Test RMSE: {val_rmse:.2f} | Test R2: [{r2_str}]")
+
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
+        final_metrics = evaluate_model(model, test_loader, device, y_scaler=Y_scaler)
+        
+        r2_str = ", ".join([f"{r:.2f}" for r in final_metrics['r2_per_target']])
+        print("\n--- Final Model Performance (Best Epoch) ---")
+        print(f"Artifacts saved: '{model_path}', 'X_scaler.joblib', 'Y_scaler.joblib'")
+        print(f"Test RMSE: {final_metrics['rmse']:.2f} mg/L")
+        print(f"Test MAE: {final_metrics['mae']:.2f} mg/L")
+        print(f"Test R2 (BOD, COD, TDS): {r2_str}")
+        print("-------------------------------------------\n")
+    else:
+        print("\nModel training failed: Best model artifact was not saved.")
+
+if __name__ == "__main__":
+    main_pipeline()
