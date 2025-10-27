@@ -1,0 +1,50 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+
+class EffluentDataset(Dataset):
+    def __init__(self, X, coords, Y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.coords = torch.tensor(coords, dtype=torch.float32)
+        self.Y = torch.tensor(Y, dtype=torch.float32)
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.coords[idx], self.Y[idx]
+
+class CNNLSTMMulti(nn.Module):
+    def __init__(self, n_features, conv_channels=32, kernel_size=3, lstm_hidden=128, lstm_layers=1, coord_dim=2, out_dim=3):
+        super(CNNLSTMMulti, self).__init__()
+        
+        self.conv = nn.Conv1d(in_channels=n_features, out_channels=conv_channels, 
+                              kernel_size=kernel_size, padding=kernel_size//2)
+        self.relu = nn.ReLU()
+        
+        self.lstm = nn.LSTM(input_size=conv_channels, hidden_size=lstm_hidden, 
+                            num_layers=lstm_layers, batch_first=False)
+        
+        self.fc1 = nn.Linear(lstm_hidden + coord_dim, 64)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(64, out_dim)
+
+    def forward(self, x, coords):
+        
+        x = self.conv(x)
+        x = self.relu(x) 
+        
+        x = x.permute(2,0,1)    
+        
+        out, _ = self.lstm(x)
+        
+        last = out[-1] 
+        
+        cat = torch.cat([last, coords], dim=1)
+        
+        h = self.fc1(cat)
+        h = self.relu(h)
+        h = self.dropout(h)
+        out = self.fc2(h)
+        
+        return out
